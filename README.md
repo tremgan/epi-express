@@ -1,5 +1,10 @@
 # ML4G Project 1
 
+
+## Inspo/Tutorial
+
+https://github.com/aertslab/crested
+
 ## Tools 
 
 https://github.com/deeptools/pyBigWig
