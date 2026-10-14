@@ -9,4 +9,5 @@ dependencies = [
     "numpy>=2.5.3",
     "pandas>=3.0.6",
     "pybigtools>=0.3.0",
+    "torch>=2.14.1",
 ]
