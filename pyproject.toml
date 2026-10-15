@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=3.0.6",
     "pybigtools>=0.3.0",
     "torch>=2.14.1",
+    "typer>=0.27.3",
 ]
 
 [build-system]

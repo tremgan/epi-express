@@ -1,6 +1,7 @@
 import pandas as pd
 import glob
 import os
+from dataclasses import dataclass
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -91,15 +92,25 @@ ALL_TRACKS = [
     "H3K9me3",
 ]
 
-# i would say upstream is more informative in regrards to regulatory aspect, other methods shift their windows to include more upstream as well
-UPSTREAM_WINDOW = 1024  # multiples of BIN_SIZE so bins are exact
-DOWNSTREAM_WINDOW = 512
+@dataclass(frozen=True)
+class WindowSettings:
+    """bp around the TSS (strand-aware) and bin size for the track windows"""
 
-BIN_SIZE = 16
-N_BINS = (UPSTREAM_WINDOW + DOWNSTREAM_WINDOW) // BIN_SIZE
+    # i would say upstream is more informative in regrards to regulatory aspect, other methods shift their windows to include more upstream as well
+    upstream: int = 1024
+    downstream: int = 512
+    bin_size: int = 16
+
+    def __post_init__(self):
+        if self.upstream % self.bin_size or self.downstream % self.bin_size:
+            raise ValueError(f"upstream/downstream must be multiples of bin_size, got {self}")
+
+    @property
+    def n_bins(self):
+        return (self.upstream + self.downstream) // self.bin_size
 
 
-def tss_features(genes, cell_line, tracks=ALL_TRACKS):
+def tss_features(genes, cell_line, window=WindowSettings(), tracks=ALL_TRACKS):
     # Mean bigWig signal in [TSS - WINDOW, TSS + WINDOW] for each track. One row per gene.
     tss = ((genes["TSS_start"] + genes["TSS_end"]) // 2).to_numpy()
     feats = {}
@@ -110,8 +121,8 @@ def tss_features(genes, cell_line, tracks=ALL_TRACKS):
             [
                 bw.values(
                     chrom,
-                    max(int(pos) - UPSTREAM_WINDOW, 0),
-                    min(int(pos) + DOWNSTREAM_WINDOW, sizes[chrom]),
+                    max(int(pos) - window.upstream, 0),
+                    min(int(pos) + window.downstream, sizes[chrom]),
                     bins=1,
                     summary="mean",
                     fillna=0,
@@ -122,7 +133,7 @@ def tss_features(genes, cell_line, tracks=ALL_TRACKS):
     return pd.DataFrame(feats, index=genes.index)
 
 
-def tss_window_tracks(gene_info, cell_line, tracks=ALL_TRACKS):
+def tss_window_tracks(gene_info, cell_line, window=WindowSettings(), tracks=ALL_TRACKS):
     """get actual sequence resolved track signal over multiple tracks (as opposed to mean summary)"""
 
     tss = ((gene_info["TSS_start"] + gene_info["TSS_end"]) // 2).to_numpy()
@@ -135,15 +146,15 @@ def tss_window_tracks(gene_info, cell_line, tracks=ALL_TRACKS):
         for chrom, pos, neg in zip(gene_info["chr"], tss, minus):
             # upstream is to the right on the minus strand
             up, down = (
-                (DOWNSTREAM_WINDOW, UPSTREAM_WINDOW)
+                (window.downstream, window.upstream)
                 if neg
-                else (UPSTREAM_WINDOW, DOWNSTREAM_WINDOW)
+                else (window.upstream, window.downstream)
             )
             v = bw.values(
                 chrom,
                 start=max(int(pos) - up, 0),
                 end=int(pos) + down,  # past chromosome end -> oob=0
-                bins=N_BINS,
+                bins=window.n_bins,
                 summary="mean",
                 fillna=0,
                 oob=0,
@@ -151,20 +162,25 @@ def tss_window_tracks(gene_info, cell_line, tracks=ALL_TRACKS):
             rows.append(v[::-1] if neg else v)  # flip so upstream is always on the left
         windows[track] = np.stack(rows)
 
-    return np.stack([windows[t] for t in tracks], axis=1)  # (n_genes, n_tracks, N_BINS)
+    return np.stack([windows[t] for t in tracks], axis=1)  # (n_genes, n_tracks, n_bins)
 
 
 def make_loader(
-    split, tracks=ALL_TRACKS, cells=("X1", "X2"), batch_size=64, shuffle=True
+    split,
+    window=WindowSettings(),
+    tracks=ALL_TRACKS,
+    cells=("X1", "X2"),
+    batch_size=64,
+    shuffle=True,
 ):
 
     genes = ALL_GENES[(ALL_GENES["cell"].isin(cells)) & (ALL_GENES["split"] == split)]
 
-    X = np.empty(shape=(len(genes), len(tracks), N_BINS), dtype=np.float32)
+    X = np.empty(shape=(len(genes), len(tracks), window.n_bins), dtype=np.float32)
 
     for cell in cells:
         mask = (genes["cell"] == cell).to_numpy()
-        X[mask] = tss_window_tracks(genes[mask], cell, tracks)
+        X[mask] = tss_window_tracks(genes[mask], cell, window, tracks)
 
     X = torch.from_numpy(
         np.log1p(X)

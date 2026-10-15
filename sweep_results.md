@@ -1,0 +1,12 @@
+# Sweep: learning rate × window size (2026-10-15 13:12)
+
+Best val Spearman (epoch of best) for ConvMaxPoolFeedForward; window = factor × (1024 bp upstream / 512 bp downstream), 16 bp bins, SGD (momentum 0.9, weight decay 1e-4), 30 epochs.
+
+| window | lr 1e-3 | lr 3e-3 | lr 1e-2 | lr 3e-2 |
+|---|---|---|---|---|
+| 1× | 0.824 (5) | 0.826 (3) | 0.824 (5) | 0.827 (11) |
+| 2× | 0.801 (8) | 0.810 (8) | 0.812 (15) | 0.807 (4) |
+| 4× | 0.785 (9) | 0.790 (8) | 0.794 (15) | 0.753 (3), diverged |
+| 8× | 0.756 (8) | 0.760 (7) | 0.757 (14) | 0.309 (22), diverged |
+
+Each doubling of the window lowers val Spearman by about 0.02 regardless of learning rate, which barely matters between 1e-3 and 1e-2 while 3e-2 diverges for wide windows. Because global max pooling cannot tell where in the window a signal sits, extra distal sequence seems to add noise rather than information.
