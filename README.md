@@ -1,5 +1,9 @@
 # ML4G Project 1
 
+## Layout
+
+model_infrastruture contains training, data_prep
+
 
 ## Inspo/Tutorial
 

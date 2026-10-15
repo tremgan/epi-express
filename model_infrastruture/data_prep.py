@@ -2,6 +2,10 @@ import pandas as pd
 import glob
 import os
 
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+
 DATA_DIR = "data"   # relative to the project root, where this notebook lives
 WORK_DIR = "."      # submission.csv is written here
 
@@ -65,7 +69,7 @@ ALL_TRACKS = ["DNase", "H3K4me3", "H3K4me1", "H3K27ac", "H3K36me3", "H3K27me3", 
 UPSTREAM_WINDOW = 1000            
 DOWNSTREAM_WINDOW = 500 
 
-BIN_SIZE = 10
+BIN_SIZE = 16
 N_BINS = (UPSTREAM_WINDOW + DOWNSTREAM_WINDOW) // BIN_SIZE
 
 def tss_features(genes, cell_line, tracks=ALL_TRACKS):
@@ -108,9 +112,33 @@ def tss_window_tracks(genes, cell_line, tracks=ALL_TRACKS):
     return np.stack([windows[t] for t in tracks], axis=1)  # (n_genes, n_tracks, N_BINS)
 
 
+def make_loader(split, 
+                tracks=ALL_TRACKS,
+                cells=('X1', 'X2'), 
+                batch_size=64, 
+                shuffle=True):
+
+
+    genes = ALL_GENES[(ALL_GENES['cell'].isin(cells)) & (ALL_GENES['split'] == split)]
+
+    X = np.empty(shape=(len(genes), len(tracks), N_BINS),
+                dtype=np.float32)
+
+    for cell in cells:
+        mask = (genes["cell"] == cell).to_numpy()
+        X[mask] = tss_window_tracks(genes[mask], cell, tracks)
+
+    X = torch.from_numpy(np.log1p(X)) # distribution is heavilly skewed, hence logarithmized
+
+    if split == "test":
+        return DataLoader(TensorDataset(X), batch_size=batch_size, shuffle=False)
+    y = torch.from_numpy(np.log1p(genes["gex"].to_numpy(np.float32)))
+    return DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=shuffle)
+
+
+
 
 if __name__ == '__main__':
     print(f"{len(ALL_FILES)} files found under {DATA_DIR}/")
 
     
-    print(tss_window_tracks(genes=ALL_GENES, cell_line='X1', tracks=ALL_TRACKS).shape)
