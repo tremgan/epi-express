@@ -9,7 +9,6 @@ ALL_FILES = sorted(
     p for p in glob.glob(os.path.join(DATA_DIR, "**", "*"), recursive=True)
     if os.path.isfile(p)
 )
-print(f"{len(ALL_FILES)} files found under {DATA_DIR}/")
 
 def find_file(name):
     # Path of the unique file whose name is `name` (e.g. the CAGE-train *_info.tsv / *_y.tsv files).
@@ -47,3 +46,71 @@ def get_gene_info():
     ("X3", "test"):  load_split("X3", "test"),
     }
 
+# all gene ids
+# every gene row from every split, with `cell` and `split` columns (gex is NaN for X3 test)
+ALL_GENES = pd.concat(get_gene_info(), names=["cell", "split"]).reset_index(["cell", "split"]).reset_index(drop=True)
+
+
+# =========== Track signals stuff ==============
+
+import pybigtools
+import numpy as np
+
+
+
+
+ALL_TRACKS = ["DNase", "H3K4me3", "H3K4me1", "H3K27ac", "H3K36me3", "H3K27me3", "H3K9me3"]
+
+# i would say upstream is more informative in regrards to regulatory aspect, other methods shift their windows to include more upstream as well
+UPSTREAM_WINDOW = 1000            
+DOWNSTREAM_WINDOW = 500 
+
+BIN_SIZE = 10
+N_BINS = (UPSTREAM_WINDOW + DOWNSTREAM_WINDOW) // BIN_SIZE
+
+def tss_features(genes, cell_line, tracks=ALL_TRACKS):
+    # Mean bigWig signal in [TSS - WINDOW, TSS + WINDOW] for each track. One row per gene.
+    tss = ((genes["TSS_start"] + genes["TSS_end"]) // 2).to_numpy()
+    feats = {}
+    for track in tracks:
+        bw = pybigtools.open(find_track(track, cell_line, "bigwig"))
+        sizes = bw.chroms()
+        feats[track] = np.array([
+            bw.values(chrom, max(int(pos) - UPSTREAM_WINDOW, 0), min(int(pos) + DOWNSTREAM_WINDOW, sizes[chrom]),
+                      bins=1, summary="mean", fillna=0)[0]
+            for chrom, pos in zip(genes["chr"], tss)
+        ])
+    return pd.DataFrame(feats, index=genes.index)
+
+def tss_window_tracks(genes, cell_line, tracks=ALL_TRACKS):
+    """get actual sequence resolved track signal over multiple tracks (as opposed to mean summary)"""
+
+    tss = ((genes["TSS_start"] + genes["TSS_end"]) // 2).to_numpy()
+    minus = (genes["strand"] == "-").to_numpy()
+    windows = {}
+
+    for track in tracks:
+        bw = pybigtools.open(find_track(track, cell_line, "bigwig"))
+        rows = []
+        for chrom, pos, neg in zip(genes["chr"], tss, minus):
+            # upstream is to the right on the minus strand
+            up, down = (DOWNSTREAM_WINDOW, UPSTREAM_WINDOW) if neg else (UPSTREAM_WINDOW, DOWNSTREAM_WINDOW)
+            v = bw.values(chrom,
+                          start=max(int(pos) - up, 0),
+                          end=int(pos) + down,  # past chromosome end -> oob=0
+                          bins=N_BINS,
+                          summary="mean",
+                          fillna=0,
+                          oob=0)
+            rows.append(v[::-1] if neg else v)  # flip so upstream is always on the left
+        windows[track] = np.stack(rows)
+
+    return np.stack([windows[t] for t in tracks], axis=1)  # (n_genes, n_tracks, N_BINS)
+
+
+
+if __name__ == '__main__':
+    print(f"{len(ALL_FILES)} files found under {DATA_DIR}/")
+
+    
+    print(tss_window_tracks(genes=ALL_GENES, cell_line='X1', tracks=ALL_TRACKS).shape)
