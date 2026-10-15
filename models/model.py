@@ -5,7 +5,7 @@ import torch.nn as nn
 
 
 class ConvTower(nn.Module):
-    def __init__(self, in_channels, start_n_filters=10, kernel_size=5, n_layers=3, stride=3, filter_factor=3) -> None:
+    def __init__(self, in_channels=7, kernel_size=5, n_layers=3, stride=3, filter_factor=3) -> None:
         super().__init__()
 
         self.layers = nn.ModuleList()
@@ -37,7 +37,17 @@ class ConvAttPoolModel(nn.Module):
 
 
 class ConvMaxPoolFeedForward(nn.Module):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    """1d conv until and maxpool along length dimension to get a fixed length vector as input to a borring mlp"""
+    def __init__(self, in_channels=7, hidden=64, **tower_kwargs: Any) -> None:
+        super().__init__()
+        self.tower = ConvTower(in_channels, **tower_kwargs)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.tower.out_channels, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
 
-    
+    def forward(self, x):                      # x: (B, tracks, bins)
+        x = self.tower(x)                      # (B, C, L')
+        x = x.amax(dim=-1)                     # max over length -> (B, C)
+        return self.mlp(x)                     # (B, 1)
