@@ -1,3 +1,5 @@
+import os
+
 import pybigtools
 import pandas as pd
 import torch
@@ -11,16 +13,11 @@ from torch.optim import SGD
 from torch.utils.data import Dataset, DataLoader
 
 
-from model_infrastruture.data_prep import WindowSettings, make_loader
+from model_infrastruture import config
+from model_infrastruture.config import DEVICE, WindowSettings
+from model_infrastruture.data_prep import make_loader
 
 from models.model import ConvMaxPoolFeedForward
-
-DEVICE = (
-    "cuda" if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available()
-    else "cpu"
-)
-
 
 def train(
     model: nn.Module,
@@ -28,11 +25,13 @@ def train(
     optimizer,
     train_loader: DataLoader,
     val_loader: DataLoader | None = None,
-    n_epochs=50,
+    n_epochs=config.EPOCHS,
+    ckpt_path: str | None = None,  # best-val-spearman weights are saved here
 ):
     model.to(DEVICE)  # in place, so an optimizer built on model.parameters() still works
     print(f"training on {DEVICE}")
     history = []  # (epoch, val_loss, val_spearman) per epoch
+    best = float("-inf")
 
     for epoch in range(n_epochs):  # loop over the dataset multiple times
         model.train()
@@ -57,6 +56,10 @@ def train(
             val_loss, val_rho = evaluate(model, loss_function, val_loader)
             msg += f" | val loss {val_loss:.3f} | val spearman {val_rho:.3f}"
             history.append((epoch + 1, val_loss, val_rho))
+            if ckpt_path and val_rho > best:  # nan (diverged) never wins
+                best = val_rho
+                torch.save(model.state_dict(), ckpt_path)
+                msg += " *"
         print(msg)
     print("Finished Training")
     return history
@@ -78,10 +81,10 @@ def evaluate(model: nn.Module, loss_function, dataloader: DataLoader):
 
 
 def main(
-    lr: float = 1e-2,
-    momentum: float = 0.9,
-    weight_decay: float = 1e-4,
-    epochs: int = 50,
+    lr: float = config.LR,
+    momentum: float = config.MOMENTUM,
+    weight_decay: float = config.WEIGHT_DECAY,
+    epochs: int = config.EPOCHS,
     upstream: int = WindowSettings.upstream,
     downstream: int = WindowSettings.downstream,
     bin_size: int = WindowSettings.bin_size,
@@ -92,13 +95,17 @@ def main(
     train_loader = make_loader(split='train', window=window)
     val_loader = make_loader(split='val', window=window, shuffle=False)
 
-    model = ConvMaxPoolFeedForward(in_channels=7)
+    os.makedirs(config.CKPT_DIR, exist_ok=True)
+    ckpt_path = os.path.join(config.CKPT_DIR, f"lr{lr}_w{upstream}-{downstream}_b{bin_size}.pt")
+
+    model = ConvMaxPoolFeedForward(in_channels=len(config.ALL_TRACKS))
     train(model=model,
           optimizer=SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay),
           loss_function=nn.MSELoss(),
           train_loader=train_loader,
           val_loader=val_loader,
           n_epochs=epochs,
+          ckpt_path=ckpt_path,
           )
 
 

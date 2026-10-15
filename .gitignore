@@ -1,4 +1,5 @@
 /data
+/checkpoints
 /.venv
 submission.csv
 CLAUDE.md
