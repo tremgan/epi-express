@@ -10,17 +10,17 @@ class ConvTower(nn.Module):
 
         self.layers = nn.ModuleList()
         channels = in_channels
-        for i in range(n_layers):
-            out_channel = start_n_filters * (filter_factor ** i)
+        for _ in range(n_layers):
+            out_channels = channels * filter_factor
             self.layers.append(
                 nn.Sequential(
-                    nn.Conv1d(channel, out_channel, kernel_size=kernel_size, stride=stride, padding=2),
-                    nn.BatchNorm1d(out_channel),
+                    nn.Conv1d(channels, out_channels, kernel_size=kernel_size, stride=stride, padding=2),
+                    nn.BatchNorm1d(out_channels),
                     nn.GELU(),
                 )
             )
-            channel = out_channel
-        self.out_channels = channel
+            channels = out_channels
+        self.out_channels = channels
 
     def forward(self, x):
         for layer in self.layers:
@@ -34,3 +34,10 @@ class ConvAttPoolModel(nn.Module):
 
     def forward(self):
         pass
+
+
+class ConvMaxPoolFeedForward(nn.Module):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+
+    
