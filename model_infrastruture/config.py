@@ -44,6 +44,7 @@ class WindowSettings:
 
 
 # ---- training defaults (CLI flags in train.py override these) ----
+SEED = 0
 BATCH_SIZE = 64
 LR = 1e-2
 MOMENTUM = 0.9

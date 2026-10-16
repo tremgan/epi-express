@@ -88,15 +88,17 @@ def main(
     upstream: int = WindowSettings.upstream,
     downstream: int = WindowSettings.downstream,
     bin_size: int = WindowSettings.bin_size,
+    seed: int = config.SEED,
 ):
     """Train ConvMaxPoolFeedForward on X1+X2 train, validate on X1+X2 val."""
+    torch.manual_seed(seed)  # seeds CPU/CUDA/MPS: weight init + DataLoader shuffle
     window = WindowSettings(upstream, downstream, bin_size)
     print(window)
     train_loader = make_loader(split='train', window=window)
     val_loader = make_loader(split='val', window=window, shuffle=False)
 
     os.makedirs(config.CKPT_DIR, exist_ok=True)
-    ckpt_path = os.path.join(config.CKPT_DIR, f"lr{lr}_w{upstream}-{downstream}_b{bin_size}.pt")
+    ckpt_path = os.path.join(config.CKPT_DIR, f"lr{lr}_w{upstream}-{downstream}_b{bin_size}_s{seed}.pt")
 
     model = ConvMaxPoolFeedForward(in_channels=len(config.ALL_TRACKS))
     train(model=model,
