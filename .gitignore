@@ -1,3 +1,6 @@
 /data
 /.venv
 submission.csv
+/checkpoints
+__pycache__/
+.DS_Store

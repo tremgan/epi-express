@@ -1,4 +1,5 @@
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -18,8 +19,10 @@ class ConvTower(nn.Module):
     dropout > 0 adds channel-wise Dropout1d after every block.
     Padding is dilation * (kernel_size - 1) // 2, so stride 1 keeps the length (odd kernel sizes).
     """
-    def __init__(self, in_channels=7, kernel_size=5, n_layers=3, stride=3, filter_factor=3,
-                 strides=None, dilations=None, channels=None, dropout=0.0) -> None:
+    def __init__(self, in_channels: int = 7, kernel_size: int = 5, n_layers: int = 3, stride: int = 3,
+                 filter_factor: int = 3, strides: Optional[Sequence[int]] = None,
+                 dilations: Optional[Sequence[int]] = None, channels: Optional[Sequence[int]] = None,
+                 dropout: float = 0.0) -> None:
         super().__init__()
 
         given = [len(v) for v in (strides, dilations, channels) if v is not None]
@@ -27,15 +30,16 @@ class ConvTower(nn.Module):
             n_layers = given[0]
             if any(g != n_layers for g in given):
                 raise ValueError("strides, dilations and channels must have the same length")
-        strides = list(strides) if strides is not None else [stride] * n_layers
-        dilations = list(dilations) if dilations is not None else [1] * n_layers
-        if channels is None:
-            channels = [in_channels * filter_factor ** (i + 1) for i in range(n_layers)]
-        channels = list(channels)
+        strides_l = list(strides) if strides is not None else [stride] * n_layers
+        dilations_l = list(dilations) if dilations is not None else [1] * n_layers
+        if channels is not None:
+            channels_l = list(channels)
+        else:
+            channels_l = [in_channels * filter_factor ** (i + 1) for i in range(n_layers)]
 
         self.layers = nn.ModuleList()
         prev = in_channels
-        for out_channels, s, d in zip(channels, strides, dilations):
+        for out_channels, s, d in zip(channels_l, strides_l, dilations_l):
             block = [
                 nn.Conv1d(prev, out_channels, kernel_size=kernel_size, stride=s,
                           padding=d * (kernel_size - 1) // 2, dilation=d),
@@ -105,7 +109,7 @@ class TwoScaleModel(nn.Module):
     def __init__(self, in_channels=7, hidden=64, attn_hidden=32, dropout=0.2, mlp_dropout=0.3,
                  **tower_kwargs: Any) -> None:
         super().__init__()
-        cfg = dict(channels=(32, 64, 64), strides=(1, 2, 2), dropout=dropout)
+        cfg: dict[str, Any] = dict(channels=(32, 64, 64), strides=(1, 2, 2), dropout=dropout)
         cfg.update(tower_kwargs)
         self.fine_tower = ConvTower(in_channels, **cfg)
         self.coarse_tower = ConvTower(in_channels, **cfg)
