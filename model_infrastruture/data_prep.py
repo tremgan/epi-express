@@ -1,3 +1,4 @@
+from functools import lru_cache
 import pandas as pd
 import glob
 import os
@@ -74,6 +75,8 @@ ALL_GENES = (
     .reset_index(drop=True)
 )
 
+print(all_genes := ALL_GENES.head(3))  # show a few rows
+
 
 # =========== Track signals stuff ==============
 
@@ -92,11 +95,18 @@ ALL_TRACKS = [
 ]
 
 # i would say upstream is more informative in regrards to regulatory aspect, other methods shift their windows to include more upstream as well
-UPSTREAM_WINDOW = 1024  # multiples of BIN_SIZE so bins are exact
+UPSTREAM_WINDOW = 1024  # fine scale: promoter resolution (multiples of BIN_SIZE so bins are exact)
 DOWNSTREAM_WINDOW = 512
-
 BIN_SIZE = 16
-N_BINS = (UPSTREAM_WINDOW + DOWNSTREAM_WINDOW) // BIN_SIZE
+N_BINS = (UPSTREAM_WINDOW + DOWNSTREAM_WINDOW) // BIN_SIZE  # 96
+
+COARSE_UPSTREAM_WINDOW = 10240  # coarse scale: distal context, used when make_loader(coarse=True)
+COARSE_DOWNSTREAM_WINDOW = 10240
+COARSE_BIN_SIZE = 128
+COARSE_N_BINS = (COARSE_UPSTREAM_WINDOW + COARSE_DOWNSTREAM_WINDOW) // COARSE_BIN_SIZE  # 160
+
+assert (UPSTREAM_WINDOW + DOWNSTREAM_WINDOW) % BIN_SIZE == 0
+assert (COARSE_UPSTREAM_WINDOW + COARSE_DOWNSTREAM_WINDOW) % COARSE_BIN_SIZE == 0
 
 
 def tss_features(genes, cell_line, tracks=ALL_TRACKS):
@@ -122,8 +132,16 @@ def tss_features(genes, cell_line, tracks=ALL_TRACKS):
     return pd.DataFrame(feats, index=genes.index)
 
 
-def tss_window_tracks(gene_info, cell_line, tracks=ALL_TRACKS):
-    """get actual sequence resolved track signal over multiple tracks (as opposed to mean summary)"""
+def tss_window_tracks(
+    gene_info, cell_line, tracks=ALL_TRACKS, upstream=None, downstream=None, n_bins=None
+):
+    """get actual sequence resolved track signal over multiple tracks (as opposed to mean summary).
+
+    Window sizes default to the fine scale (UPSTREAM_WINDOW / DOWNSTREAM_WINDOW / N_BINS).
+    """
+    upstream = UPSTREAM_WINDOW if upstream is None else upstream
+    downstream = DOWNSTREAM_WINDOW if downstream is None else downstream
+    n_bins = N_BINS if n_bins is None else n_bins
 
     tss = ((gene_info["TSS_start"] + gene_info["TSS_end"]) // 2).to_numpy()
     minus = (gene_info["strand"] == "-").to_numpy()
@@ -134,16 +152,12 @@ def tss_window_tracks(gene_info, cell_line, tracks=ALL_TRACKS):
         rows = []
         for chrom, pos, neg in zip(gene_info["chr"], tss, minus):
             # upstream is to the right on the minus strand
-            up, down = (
-                (DOWNSTREAM_WINDOW, UPSTREAM_WINDOW)
-                if neg
-                else (UPSTREAM_WINDOW, DOWNSTREAM_WINDOW)
-            )
+            up, down = (downstream, upstream) if neg else (upstream, downstream)
             v = bw.values(
                 chrom,
                 start=max(int(pos) - up, 0),
                 end=int(pos) + down,  # past chromosome end -> oob=0
-                bins=N_BINS,
+                bins=n_bins,
                 summary="mean",
                 fillna=0,
                 oob=0,
@@ -151,29 +165,73 @@ def tss_window_tracks(gene_info, cell_line, tracks=ALL_TRACKS):
             rows.append(v[::-1] if neg else v)  # flip so upstream is always on the left
         windows[track] = np.stack(rows)
 
-    return np.stack([windows[t] for t in tracks], axis=1)  # (n_genes, n_tracks, N_BINS)
+    return np.stack([windows[t] for t in tracks], axis=1)  # (n_genes, n_tracks, n_bins)
+
+
+@lru_cache(maxsize=None)
+def cell_windows(cell, tracks, upstream, downstream, n_bins):
+    """log1p track windows for ALL genes of one cell line, in ALL_GENES order. Computed once per
+    (cell, tracks, window) and cached, so train / val / stats share a single pass over the bigWigs."""
+    genes = ALL_GENES[ALL_GENES["cell"] == cell]
+    X = tss_window_tracks(genes, cell, list(tracks), upstream, downstream, n_bins)
+    return np.log1p(X).astype(np.float32)  # distribution is heavilly skewed, hence logarithmized
+
+
+@lru_cache(maxsize=None)
+def cell_track_stats(cell, tracks, upstream, downstream, n_bins):
+    """Mean and std of every track in one cell line (log1p scale), over all its genes and bins.
+
+    Uses the inputs of ALL splits of that cell (no labels, so no leakage), which keeps
+    train and val on the same scale. Returns two (1, n_tracks, 1) float32 arrays.
+    """
+    X = cell_windows(cell, tracks, upstream, downstream, n_bins)
+    mean = X.mean(axis=(0, 2), keepdims=True).astype(np.float32)
+    std = X.std(axis=(0, 2), keepdims=True).astype(np.float32)
+    return mean, np.maximum(std, 1e-6)  # guard against constant tracks
+
+
+def _scale_tensor(genes, split, cells, tracks, upstream, downstream, n_bins, normalize):
+    """(len(genes), n_tracks, n_bins) tensor for one window scale, rows aligned with `genes`."""
+    tracks = tuple(tracks)
+    X = np.empty(shape=(len(genes), len(tracks), n_bins), dtype=np.float32)
+    for cell in cells:
+        cell_genes = ALL_GENES[ALL_GENES["cell"] == cell]
+        full = cell_windows(cell, tracks, upstream, downstream, n_bins)
+        if normalize:  # z-score each track within each cell line (cells differ in depth / scale)
+            mean, std = cell_track_stats(cell, tracks, upstream, downstream, n_bins)
+            full = (full - mean) / std
+        X[(genes["cell"] == cell).to_numpy()] = full[(cell_genes["split"] == split).to_numpy()]
+    return torch.from_numpy(X)
 
 
 def make_loader(
-    split, tracks=ALL_TRACKS, cells=("X1", "X2"), batch_size=64, shuffle=True
+    split,
+    tracks=ALL_TRACKS,
+    cells=("X1", "X2"),
+    batch_size=64,
+    shuffle=True,
+    normalize=True,
+    coarse=False,
 ):
+    """Batches are (fine, y), or (fine, coarse, y) with coarse=True. The test split has no y."""
 
     genes = ALL_GENES[(ALL_GENES["cell"].isin(cells)) & (ALL_GENES["split"] == split)]
 
-    X = np.empty(shape=(len(genes), len(tracks), N_BINS), dtype=np.float32)
-
-    for cell in cells:
-        mask = (genes["cell"] == cell).to_numpy()
-        X[mask] = tss_window_tracks(genes[mask], cell, tracks)
-
-    X = torch.from_numpy(
-        np.log1p(X)
-    )  # distribution is heavilly skewed, hence logarithmized
+    inputs = [
+        _scale_tensor(genes, split, cells, tracks, UPSTREAM_WINDOW, DOWNSTREAM_WINDOW, N_BINS, normalize)
+    ]
+    if coarse:
+        inputs.append(
+            _scale_tensor(
+                genes, split, cells, tracks,
+                COARSE_UPSTREAM_WINDOW, COARSE_DOWNSTREAM_WINDOW, COARSE_N_BINS, normalize,
+            )
+        )
 
     if split == "test":
-        return DataLoader(TensorDataset(X), batch_size=batch_size, shuffle=False)
+        return DataLoader(TensorDataset(*inputs), batch_size=batch_size, shuffle=False)
     y = torch.from_numpy(np.log1p(genes["gex"].to_numpy(np.float32)))
-    return DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=shuffle)
+    return DataLoader(TensorDataset(*inputs, y), batch_size=batch_size, shuffle=shuffle)
 
 
 if __name__ == "__main__":
