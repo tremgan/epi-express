@@ -84,19 +84,23 @@ import numpy as np
 ALL_TRACKS = [
     "DNase",
     "H3K4me3",
-    "H3K4me1",
     "H3K27ac",
     "H3K36me3",
-    "H3K27me3",
-    "H3K9me3",
 ]
 
 # i would say upstream is more informative in regrards to regulatory aspect, other methods shift their windows to include more upstream as well
-UPSTREAM_WINDOW = 1024  # multiples of BIN_SIZE so bins are exact
-DOWNSTREAM_WINDOW = 512
+UPSTREAM_WINDOW = 5000 # multiples of BIN_SIZE so bins are exact
+DOWNSTREAM_WINDOW = 5000
 
-BIN_SIZE = 16
+BIN_SIZE = 50
 N_BINS = (UPSTREAM_WINDOW + DOWNSTREAM_WINDOW) // BIN_SIZE
+
+# Sequence-derived channels from the reference genome (hg38), binned like the tracks.
+# Set USE_SEQ_FEATURES = False to go back to the 7 track channels only.
+USE_SEQ_FEATURES = True
+SEQ_FEATURES = ["GC", "CpG"]  # GC fraction, CpG dinucleotides per bp
+N_CHANNELS = len(ALL_TRACKS) + (len(SEQ_FEATURES) if USE_SEQ_FEATURES else 0)
+GENOME_FASTA = os.path.join("genome", "hg38.fa")  # uncompressed; pyfaidx writes hg38.fa.fai next to it
 
 
 def tss_features(genes, cell_line, tracks=ALL_TRACKS):
@@ -154,9 +158,89 @@ def tss_window_tracks(gene_info, cell_line, tracks=ALL_TRACKS):
     return np.stack([windows[t] for t in tracks], axis=1)  # (n_genes, n_tracks, N_BINS)
 
 
+# =========== Reference genome (sequence) features ==============
+
+_GENOME = None
+
+
+def _genome():
+    """Open the hg38 FASTA once and check it matches the bigWig coordinate system."""
+    global _GENOME
+    if _GENOME is None:
+        if not os.path.isfile(GENOME_FASTA):
+            raise FileNotFoundError(
+                f"{GENOME_FASTA} not found. Download "
+                "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz, "
+                "unzip it to genome/hg38.fa, or set USE_SEQ_FEATURES = False."
+            )
+        from pyfaidx import Fasta
+
+        genome = Fasta(GENOME_FASTA)
+        sizes = pybigtools.open(find_track("DNase", "X1", "bigwig")).chroms()
+        for chrom in ("chr1", "chr14", "chr19"):
+            if chrom in sizes and len(genome[chrom]) != sizes[chrom]:
+                raise ValueError(
+                    f"{chrom}: FASTA has {len(genome[chrom])} bp but the bigWigs have "
+                    f"{sizes[chrom]} bp. Wrong genome build? Expected hg38."
+                )
+        _GENOME = genome
+    return _GENOME
+
+
+def window_seq(genome, chrom, start, end):
+    """Upper-case bases of [start, end) as a uint8 array of length end - start.
+    Positions outside the chromosome are 'N'."""
+    chrom_len = len(genome[chrom])
+    s, e = max(start, 0), min(end, chrom_len)
+    if e <= s:
+        return np.full(end - start, ord("N"), dtype=np.uint8)
+    seq = "N" * (s - start) + genome[chrom][s:e].seq.upper() + "N" * (end - e)
+    return np.frombuffer(seq.encode(), dtype=np.uint8)
+
+
+def tss_sequence_features(gene_info):
+    """GC fraction and CpG density per bin, laid out exactly like tss_window_tracks
+    (same window, upstream always on the left). Shape (n_genes, 2, N_BINS).
+    Both features are the same on both strands (CG is its own reverse complement)."""
+    genome = _genome()
+    tss = ((gene_info["TSS_start"] + gene_info["TSS_end"]) // 2).to_numpy()
+    minus = (gene_info["strand"] == "-").to_numpy()
+    A, C, G, T = (ord(b) for b in "ACGT")
+    out = np.zeros((len(gene_info), 2, N_BINS), dtype=np.float32)
+
+    def per_bin(a):
+        return a.reshape(N_BINS, BIN_SIZE).sum(axis=1)
+
+    for i, (chrom, pos, neg) in enumerate(zip(gene_info["chr"], tss, minus)):
+        up, down = (
+            (DOWNSTREAM_WINDOW, UPSTREAM_WINDOW)
+            if neg
+            else (UPSTREAM_WINDOW, DOWNSTREAM_WINDOW)
+        )
+        s = window_seq(genome, chrom, int(pos) - up, int(pos) + down)
+        is_c, is_g = s == C, s == G
+        valid = is_c | is_g | (s == A) | (s == T)
+        cg = np.zeros_like(is_c)
+        cg[:-1] = is_c[:-1] & is_g[1:]  # a C directly followed by a G, counted in the bin of the C
+        gc = per_bin(is_c | is_g) / np.maximum(per_bin(valid), 1)  # N-only bins -> 0
+        cpg = per_bin(cg) / BIN_SIZE
+        f = np.stack([gc, cpg]).astype(np.float32)
+        out[i] = f[:, ::-1] if neg else f
+    return out
+
+
 def make_loader(
-    split, tracks=ALL_TRACKS, cells=("X1", "X2"), batch_size=64, shuffle=True
+    split,
+    tracks=ALL_TRACKS,
+    cells=("X1", "X2"),
+    batch_size=64,
+    shuffle=True,
+    stats=None,
+    use_seq_features=USE_SEQ_FEATURES,
 ):
+    """stats: per-cell (mean, std) per track. Pass `train_loader.stats` when building the
+    val loader so it is scaled like train. Cells missing from `stats` (e.g. X3) get
+    their own stats from their own genes (no labels involved)."""
 
     genes = ALL_GENES[(ALL_GENES["cell"].isin(cells)) & (ALL_GENES["split"] == split)]
 
@@ -166,14 +250,31 @@ def make_loader(
         mask = (genes["cell"] == cell).to_numpy()
         X[mask] = tss_window_tracks(genes[mask], cell, tracks)
 
-    X = torch.from_numpy(
-        np.log1p(X)
-    )  # distribution is heavilly skewed, hence logarithmized
+    X = np.log1p(X)  # distribution is heavilly skewed, hence logarithmized
+
+    if use_seq_features:  # appended after the log1p: these are fractions, not skewed signal
+        X = np.concatenate([X, tss_sequence_features(genes)], axis=1)
+
+    # z-score each track within its own cell line (one mean/std per track, over genes and bins)
+    stats = {} if stats is None else dict(stats)
+    for cell in cells:
+        mask = (genes["cell"] == cell).to_numpy()
+        if cell not in stats:
+            mu = X[mask].mean(axis=(0, 2), keepdims=True)  # (1, n_tracks, 1)
+            sd = X[mask].std(axis=(0, 2), keepdims=True) + 1e-6
+            stats[cell] = (mu, sd)
+        mu, sd = stats[cell]
+        X[mask] = (X[mask] - mu) / sd
+
+    X = torch.from_numpy(X)
 
     if split == "test":
-        return DataLoader(TensorDataset(X), batch_size=batch_size, shuffle=False)
-    y = torch.from_numpy(np.log1p(genes["gex"].to_numpy(np.float32)))
-    return DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=shuffle)
+        loader = DataLoader(TensorDataset(X), batch_size=batch_size, shuffle=False)
+    else:
+        y = torch.from_numpy(np.log1p(genes["gex"].to_numpy(np.float32)))
+        loader = DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=shuffle)
+    loader.stats = stats
+    return loader
 
 
 if __name__ == "__main__":
