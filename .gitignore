@@ -1,3 +1,8 @@
 /data
 /.venv
 submission.csv
+genome/
+*.pt
+__pycache__/
+.vscode/
+submission.csv
